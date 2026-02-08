@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sat Feb  7 12:25:45 2026
-
-@author: brcum
-"""
-
-# -*- coding: utf-8 -*-
-"""
-STASIS AM SERVER v2.1
-Standalone web server for Stasis AM - Alpha Markets
+STASIS AM — Alpha Markets Server
 Deploy to: stasisAM.beyondpriceandtime.com
 Copyright © 2026 Truth Communications LLC. All Rights Reserved.
+
+Requirements:
+    pip install dash dash-bootstrap-components pandas numpy websocket-client requests gunicorn
 """
 
-import sys
 import time
 import threading
 import numpy as np
@@ -25,11 +19,9 @@ from enum import Enum
 import copy
 import json
 import os
-import signal
-import traceback
 
 import dash
-from dash import dcc, html, Input, Output, State, callback_context, no_update, dash_table
+from dash import dcc, html, Input, Output, State, callback_context, dash_table
 import dash_bootstrap_components as dbc
 import pandas as pd
 import websocket
@@ -37,22 +29,10 @@ import ssl
 import requests
 
 # ============================================================================
-# API KEYS & SERVER CONFIG
+# CONFIG
 # ============================================================================
 
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "PnzhJOXEJO7tSpHr0ct2zjFKi6XO0yGi")
-PORT = int(os.environ.get("PORT", 8050))
-HOST = os.environ.get("HOST", "0.0.0.0")
-
-# CORS origin for desktop app and PM server communication
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
-
-# PM server URL for cross-communication (if needed)
-PM_SERVER_URL = os.environ.get("PM_SERVER_URL", "https://stasisPM.beyondpriceandtime.com")
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
 
 
 @dataclass
@@ -62,25 +42,20 @@ class Config:
         "XLP", "XLB", "XLV", "XLI", "XLY", "XLC", "XLRE", "KRE",
         "SMH", "XBI", "GDX",
         'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'NVDA', 'META',
-        'TSLA', 'AVGO', 'ORCL', 'ADBE', 'CRM', 'AMD', 'INTC'
+        'TSLA', 'AVGO', 'ORCL', 'ADBE', 'CRM', 'AMD', 'INTC', 'CSCO'
     ])
-
     etf_symbols: List[str] = field(default_factory=lambda: [
         "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLU", "XLK",
         "XLP", "XLB", "XLV", "XLI", "XLY", "XLC", "XLRE", "KRE",
         "SMH", "XBI", "GDX",
     ])
-
     thresholds: List[float] = field(default_factory=lambda: [
         0.000625, 0.00125, 0.0025, 0.005, 0.0075, 0.01, 0.0125,
         0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.10
     ])
-
     am_thresholds: List[float] = field(default_factory=lambda: [
-        0.005, 0.0075, 0.01, 0.0125, 0.015, 0.02, 0.025,
-        0.03, 0.04, 0.05
+        0.005, 0.0075, 0.01, 0.0125, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05
     ])
-
     update_interval_ms: int = 1000
     cache_refresh_interval: float = 0.5
     history_days: int = 5
@@ -146,7 +121,7 @@ class StasisInfo:
 
 
 # ============================================================================
-# HELPER FUNCTIONS
+# HELPERS
 # ============================================================================
 
 
@@ -170,21 +145,8 @@ def fmt_rr(rr):
     return "0:1" if rr <= 0 else (f"{rr:.2f}:1" if rr < 10 else f"{rr:.0f}:1")
 
 
-def format_bits(bits):
-    return "".join(str(b) for b in bits) if bits else "—"
-
-
-def format_band(threshold_pct):
-    if threshold_pct < 0.1:
-        return f"{threshold_pct:.4f}%"
-    elif threshold_pct < 1:
-        return f"{threshold_pct:.3f}%"
-    else:
-        return f"{threshold_pct:.2f}%"
-
-
 # ============================================================================
-# FUNDAMENTAL DATA FUNCTIONS
+# FUNDAMENTAL DATA
 # ============================================================================
 
 
@@ -203,8 +165,7 @@ def fetch_fundamental_data_polygon(sym):
             'dates', 'revenue', 'net_income', 'operating_cash_flow',
             'capex', 'fcf', 'total_assets', 'total_liabilities',
             'shareholders_equity', 'current_assets', 'current_liabilities',
-            'total_debt', 'eps'
-        ]}
+            'total_debt', 'eps']}
         for r in results:
             try:
                 fi = r.get('financials', {})
@@ -302,13 +263,10 @@ def fetch_all_fundamental_data():
                         eq_j = fund['shareholders_equity'][j]
                         ratios['roe'].append(fund['net_income'][j] / eq_j if eq_j > 0 else None)
                         rev_j = fund['revenue'][j]
-                        ratios['net_profit_margin'].append(
-                            fund['net_income'][j] / rev_j if rev_j else None)
-                        ratios['debt_to_equity'].append(
-                            fund['total_debt'][j] / eq_j if eq_j > 0 else None)
+                        ratios['net_profit_margin'].append(fund['net_income'][j] / rev_j if rev_j else None)
+                        ratios['debt_to_equity'].append(fund['total_debt'][j] / eq_j if eq_j > 0 else None)
                         if j >= 3:
-                            ratios['fcfy'].append(
-                                sum(fund['fcf'][max(0, j - 3):j + 1]) / mcap if mcap else None)
+                            ratios['fcfy'].append(sum(fund['fcf'][max(0, j - 3):j + 1]) / mcap if mcap else None)
                         else:
                             ratios['fcfy'].append(None)
                     except:
@@ -424,13 +382,11 @@ def fetch_52_week_data():
                    f"?adjusted=true&sort=asc&limit=365&apiKey={config.polygon_api_key}")
             r = requests.get(url, timeout=15)
             if r.status_code == 200:
-                d = r.json()
-                res = d.get('results', [])
+                res = r.json().get('results', [])
                 if res:
                     hv = max(b['h'] for b in res)
                     lv = min(b['l'] for b in res)
-                    w52[sym] = {'high': hv, 'low': lv, 'range': hv - lv,
-                                'current': res[-1]['c']}
+                    w52[sym] = {'high': hv, 'low': lv, 'range': hv - lv, 'current': res[-1]['c']}
                     ok += 1
                 else:
                     w52[sym] = {'high': None, 'low': None, 'range': None, 'current': None}
@@ -440,7 +396,7 @@ def fetch_52_week_data():
                 fail += 1
             if (i + 1) % 50 == 0:
                 print(f"   52W: {i + 1}/{len(config.symbols)} (✓{ok} ✗{fail})")
-            time.sleep(0.13)
+            time.sleep(0.12)
         except:
             w52[sym] = {'high': None, 'low': None, 'range': None, 'current': None}
             fail += 1
@@ -469,7 +425,7 @@ def fetch_volume_data():
                 vols[sym] = 10.0
             if (i + 1) % 50 == 0:
                 print(f"   Vol: {i + 1}/{len(config.symbols)}")
-            time.sleep(0.13)
+            time.sleep(0.12)
         except:
             vols[sym] = 10.0
     print("✅ Volume loaded\n")
@@ -573,7 +529,7 @@ class Bitstream:
         elif prev >= 2 and sc < 2:
             self.stasis_info = None
         if sc >= 2:
-            self.direction = Direction.LONG if self.last_bit == 1 else Direction.SHORT
+            self.direction = Direction.LONG if self.last_bit == 0 else Direction.SHORT
             if sc >= 10:
                 self.signal_strength = SignalStrength.VERY_STRONG
             elif sc >= 7:
@@ -593,13 +549,9 @@ class Bitstream:
             p = live_price if live_price is not None else self.current_live_price
             si = self.stasis_info
             tp = sl = rr = None
-            distance_to_tp_pct = None
-            distance_to_sl_pct = None
-            stasis_price_change_pct = None
-
+            distance_to_tp_pct = distance_to_sl_pct = stasis_price_change_pct = None
             if si is not None:
                 stasis_price_change_pct = si.get_price_change_pct(p)
-
             if self.direction and self.current_stasis >= 2:
                 if self.direction == Direction.LONG:
                     tp, sl = self.upper_band, self.lower_band
@@ -611,24 +563,14 @@ class Bitstream:
                     rr = reward / risk
                 elif risk > 0:
                     rr = 0.0
-                else:
-                    rr = None
                 if p > 0:
                     distance_to_tp_pct = (abs(tp - p) / p) * 100
                     distance_to_sl_pct = (abs(sl - p) / p) * 100
-
-            recent_bits = [b.bit for b in list(self.bits)[-15:]]
-
             return {
-                'symbol': self.symbol,
-                'is_etf': self.is_etf,
-                'threshold': self.threshold,
-                'threshold_pct': self.threshold * 100,
-                'stasis': self.current_stasis,
-                'total_bits': self.total_bits,
-                'recent_bits': recent_bits,
-                'current_price': p,
-                'anchor_price': si.start_price if si else None,
+                'symbol': self.symbol, 'is_etf': self.is_etf,
+                'threshold': self.threshold, 'threshold_pct': self.threshold * 100,
+                'stasis': self.current_stasis, 'total_bits': self.total_bits,
+                'current_price': p, 'anchor_price': si.start_price if si else None,
                 'direction': self.direction.value if self.direction else None,
                 'signal_strength': self.signal_strength.value if self.signal_strength else None,
                 'is_tradable': (self.current_stasis >= config.min_tradable_stasis
@@ -637,9 +579,7 @@ class Bitstream:
                 'stasis_duration_str': si.get_duration_str() if si else "—",
                 'duration_seconds': si.get_duration().total_seconds() if si else 0,
                 'stasis_price_change_pct': stasis_price_change_pct,
-                'take_profit': tp,
-                'stop_loss': sl,
-                'risk_reward': rr,
+                'take_profit': tp, 'stop_loss': sl, 'risk_reward': rr,
                 'distance_to_tp_pct': distance_to_tp_pct,
                 'distance_to_sl_pct': distance_to_sl_pct,
                 'week52_percentile': calculate_52week_percentile(p, self.symbol),
@@ -663,51 +603,37 @@ class PolygonPriceFeed:
     def start(self):
         self.is_running = True
         threading.Thread(target=self._loop, daemon=True).start()
-        print("🔌 WebSocket starting...")
+        print("✅ WebSocket starting...")
 
     def _loop(self):
         while self.is_running:
             try:
                 self._connect()
             except Exception as e:
-                print(f"WS reconnect err: {e}")
+                print(f"WS err: {e}")
                 time.sleep(5)
 
     def _connect(self):
-        def on_msg(ws, raw):
+        def on_msg(ws, msg):
             try:
-                data = json.loads(raw)
-                if isinstance(data, list):
-                    for m in data:
-                        self._proc(m)
-                else:
-                    self._proc(data)
+                data = json.loads(msg)
+                for m in (data if isinstance(data, list) else [data]):
+                    self._proc(m)
             except:
                 pass
 
         def on_open(ws):
-            print("✅ WS connected, authenticating...")
+            print("✅ WS connected")
             ws.send(json.dumps({"action": "auth", "params": config.polygon_api_key}))
 
-        def on_error(ws, err):
-            print(f"WS error: {err}")
-
-        self.ws = websocket.WebSocketApp(
-            config.polygon_ws_url,
-            on_open=on_open, on_message=on_msg, on_error=on_error
-        )
+        self.ws = websocket.WebSocketApp(config.polygon_ws_url,
+                                         on_open=on_open, on_message=on_msg)
         self.ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
 
     def _proc(self, msg):
-        ev = msg.get('ev')
-        if ev == 'status':
-            status = msg.get('status', '')
-            print(f"   WS status: {status} - {msg.get('message', '')}")
-            if status == 'auth_success':
-                self._subscribe()
-            elif status == 'auth_failed':
-                print("   ❌ AUTH FAILED — check API key")
-        elif ev in ('A', 'AM', 'T', 'Q'):
+        if msg.get('ev') == 'status' and msg.get('status') == 'auth_success':
+            self._sub()
+        elif msg.get('ev') in ('A', 'AM', 'T', 'Q'):
             sym = msg.get('sym', '') or msg.get('S', '')
             price = msg.get('c') or msg.get('vw') or msg.get('p') or msg.get('bp')
             if price and sym in self.current_prices:
@@ -715,34 +641,29 @@ class PolygonPriceFeed:
                     self.current_prices[sym] = float(price)
                     self.message_count += 1
 
-    def _subscribe(self):
-        syms = list(config.symbols)
-        for i in range(0, len(syms), 50):
-            batch = syms[i:i + 50]
-            self.ws.send(json.dumps({
-                "action": "subscribe",
-                "params": ",".join(f"A.{s}" for s in batch)
-            }))
+    def _sub(self):
+        for i in range(0, len(config.symbols), 50):
+            batch = config.symbols[i:i + 50]
+            self.ws.send(json.dumps({"action": "subscribe",
+                                     "params": ",".join(f"A.{s}" for s in batch)}))
             time.sleep(0.1)
-        print(f"📡 Subscribed to {len(syms)} symbols")
+        print(f"📡 Subscribed {len(config.symbols)} symbols")
 
     def get_prices(self):
         with self.lock:
-            return {k: v for k, v in self.current_prices.items() if v is not None}
+            return {k: v for k, v in self.current_prices.items() if v}
 
     def get_status(self):
         with self.lock:
-            return {
-                'connected': sum(1 for v in self.current_prices.values() if v is not None),
-                'total': len(config.symbols),
-                'messages': self.message_count
-            }
+            return {'connected': sum(1 for v in self.current_prices.values() if v),
+                    'total': len(config.symbols), 'messages': self.message_count}
 
 
 price_feed = PolygonPriceFeed()
 
+
 # ============================================================================
-# BITSTREAM MANAGER (AM-only version)
+# BITSTREAM MANAGER
 # ============================================================================
 
 
@@ -756,11 +677,9 @@ class BitstreamManager:
         self.initialized = False
         self.backfill_complete = False
         self.backfill_progress = 0
-        self.stream_count = 0
-        self.tradable_count = 0
 
     def backfill(self):
-        print("\n" + "=" * 60 + "\n📜 BACKFILLING HISTORICAL DATA\n" + "=" * 60)
+        print("\n" + "=" * 60 + "\n📜 BACKFILLING\n" + "=" * 60)
         hist = {}
         for i, sym in enumerate(config.symbols):
             bars = fetch_historical_bars(sym, config.history_days)
@@ -768,14 +687,11 @@ class BitstreamManager:
                 hist[sym] = bars
             self.backfill_progress = int((i + 1) / len(config.symbols) * 100)
             if (i + 1) % 25 == 0:
-                print(f"   📊 {i + 1}/{len(config.symbols)} ({self.backfill_progress}%)"
-                      f" — {len(hist)} with data")
-            time.sleep(0.13)
-
-        print(f"\n   Building bitstreams from {len(hist)} symbols...")
+                print(f"   📊 {i + 1}/{len(config.symbols)} ({self.backfill_progress}%)")
+            time.sleep(0.12)
         with self.lock:
             for sym, bars in hist.items():
-                if not bars or len(bars) < 2:
+                if not bars:
                     continue
                 vol = config.volumes.get(sym, 10.0)
                 for th in config.thresholds:
@@ -783,14 +699,12 @@ class BitstreamManager:
                     self.streams[key] = Bitstream(sym, th, bars[0]['close'], vol)
                     for bar in bars:
                         self.streams[key].process_price(bar['close'], bar['timestamp'])
-
-        self.stream_count = len(self.streams)
-        self.tradable_count = sum(1 for s in self.streams.values()
-                                  if s.current_stasis >= config.min_tradable_stasis
-                                  and s.direction is not None and s.volume > 1.0)
         self.initialized = True
         self.backfill_complete = True
-        print(f"✅ Streams: {self.stream_count} | Tradable: {self.tradable_count}")
+        tradable = sum(1 for s in self.streams.values()
+                       if s.current_stasis >= config.min_tradable_stasis
+                       and s.direction is not None and s.volume > 1.0)
+        print(f"✅ Streams: {len(self.streams)} | Tradable: {tradable}")
         print("=" * 60)
 
     def start(self):
@@ -822,10 +736,7 @@ class BitstreamManager:
             with self.lock:
                 for s in self.streams.values():
                     snaps.append(s.get_snapshot(prices.get(s.symbol)))
-
             am = self._build_am(snaps)
-            self.tradable_count = sum(1 for s in am if s.get('is_tradable'))
-
             with self.cache_lock:
                 self.cached_am_data = am
 
@@ -835,10 +746,8 @@ class BitstreamManager:
             if s['threshold'] not in config.am_thresholds:
                 continue
             sms = calculate_stasis_merit_score(s)
-            fms, sd = calculate_fundamental_merit_score(
-                s['symbol'], s.get('week52_percentile'))
-            rows.append({**s, 'sms': sms, 'fms': fms, 'tms': sms + fms,
-                         'slope_details': sd})
+            fms, sd = calculate_fundamental_merit_score(s['symbol'], s.get('week52_percentile'))
+            rows.append({**s, 'sms': sms, 'fms': fms, 'tms': sms + fms, 'slope_details': sd})
         return rows
 
     def get_am_data(self):
@@ -849,104 +758,88 @@ class BitstreamManager:
 manager = BitstreamManager()
 
 # ============================================================================
-# SELECTED SYMBOL STATE (for cross-app communication)
+# DASH APP
 # ============================================================================
 
-_selected_symbol = {'symbol': None, 'lock': threading.Lock()}
+AM_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;600&display=swap');
+body { background: #f5f0e8 !important; }
+.title-font { font-family: 'Orbitron', sans-serif !important; }
+"""
 
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY],
+                suppress_callback_exceptions=True)
+app.title = "STASIS AM"
+server = app.server
 
-def set_selected_symbol(sym):
-    with _selected_symbol['lock']:
-        _selected_symbol['symbol'] = sym
-
-
-def get_selected_symbol():
-    with _selected_symbol['lock']:
-        return _selected_symbol['symbol']
-
-
-# ============================================================================
-# DASH AM APP
-# ============================================================================
-
-app = dash.Dash(
-    __name__,
-    suppress_callback_exceptions=True,
-    external_stylesheets=[dbc.themes.FLATLY],
-    title="STASIS AM",
-)
-
-server = app.server  # Flask server for Railway/Gunicorn
-
-# Add CORS headers
-@server.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', ALLOWED_ORIGINS)
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
-
+app.index_string = f'''<!DOCTYPE html>
+<html><head>
+{{%metas%}}<title>{{%title%}}</title>{{%favicon%}}{{%css%}}
+<style>{AM_CSS}</style>
+</head><body>
+{{%app_entry%}}<footer>{{%config%}}{{%scripts%}}{{%renderer%}}</footer>
+</body></html>'''
 
 app.layout = html.Div([
     dcc.Store(id='fmode', data='tradable'),
     dcc.Interval(id='tick', interval=1000, n_intervals=0),
-    html.Div(id='status', style={'fontSize': '10px', 'padding': '6px',
+
+    # Header
+    html.Div([
+        html.Span("📈", style={'fontSize': '22px'}),
+        html.Span(" STASIS AM", className="title-font ms-2",
+                  style={'fontSize': '16px', 'fontWeight': '700', 'color': '#1a5c2a',
+                         'letterSpacing': '2px'}),
+        html.Span(" — ALPHA MARKETS", className="title-font",
+                  style={'fontSize': '9px', 'color': '#888', 'letterSpacing': '1px'}),
+    ], style={'padding': '8px'}),
+
+    html.Div(id='status', style={'fontSize': '10px', 'padding': '4px 8px',
                                   'background': '#e8f5e9', 'fontWeight': 'bold'}),
+    # Filters
     html.Div([
         dbc.ButtonGroup([
-            dbc.Button("ALL", id="f-all", size="sm", outline=True,
-                       style={'fontSize': '9px'}),
+            dbc.Button("ALL", id="f-all", size="sm", outline=True, style={'fontSize': '9px'}),
             dbc.Button("TRADABLE", id="f-trad", size="sm", outline=True, active=True,
                        style={'fontSize': '9px', 'color': '#1a5c2a'}),
         ], size="sm", className="me-2"),
         dcc.Dropdown(id='f-dir',
                      options=[{'label': x, 'value': x} for x in ['ALL', 'LONG', 'SHORT']],
                      value='ALL', clearable=False,
-                     style={'width': '80px', 'fontSize': '10px',
-                            'display': 'inline-block'}),
+                     style={'width': '80px', 'fontSize': '10px', 'display': 'inline-block'}),
         dcc.Dropdown(id='f-sort', options=[
-            {'label': 'TMS ↓', 'value': 'tms'},
-            {'label': 'FMS ↓', 'value': 'fms'},
-            {'label': 'STASIS ↓', 'value': 'stasis'},
-            {'label': '52W ↑', 'value': '52w'}],
+            {'label': 'TMS ↓', 'value': 'tms'}, {'label': 'FMS ↓', 'value': 'fms'},
+            {'label': 'STASIS ↓', 'value': 'stasis'}, {'label': '52W ↑', 'value': '52w'}],
             value='tms', clearable=False,
-            style={'width': '90px', 'fontSize': '10px',
-                   'display': 'inline-block', 'marginLeft': '4px'}),
-    ], className="d-flex align-items-center p-1",
-        style={'background': '#f5f0e8'}),
-    html.Div("💡 Click any row → Desktop app navigates SA, RH & TT to that stock",
-             style={'fontSize': '9px', 'color': '#aa6600', 'padding': '2px 6px',
-                    'background': '#f5f0e8'}),
+            style={'width': '90px', 'fontSize': '10px', 'display': 'inline-block',
+                   'marginLeft': '4px'}),
+    ], className="d-flex align-items-center p-1", style={'background': '#f5f0e8'}),
+
+    # Table
     dash_table.DataTable(
-        id='tbl', row_selectable='single',
-        columns=[{'name': c, 'id': c} for c in [
+        id='tbl', columns=[{'name': c, 'id': c} for c in [
             '✓', 'SYM', 'BAND', 'STS', 'DIR', 'SMS', 'FMS', 'TMS',
             'REV5', 'FCF5', 'FCFY', '52W', 'PRICE', 'TP', 'SL', 'R:R', 'DUR']],
         sort_action='native',
-        style_table={'overflowY': 'auto'},
-        style_cell={
-            'backgroundColor': '#faf7f0', 'color': '#1a1a1a',
-            'padding': '3px 4px', 'fontSize': '10px',
-            'fontFamily': 'Consolas, monospace', 'whiteSpace': 'nowrap',
-            'textAlign': 'right', 'border': '1px solid #ddd'
-        },
+        style_table={'overflowY': 'auto', 'height': '80vh'},
+        style_cell={'backgroundColor': '#faf7f0', 'color': '#1a1a1a', 'padding': '3px 4px',
+                    'fontSize': '10px', 'fontFamily': 'Consolas, monospace',
+                    'whiteSpace': 'nowrap', 'textAlign': 'right', 'border': '1px solid #ddd'},
         style_cell_conditional=[
-            {'if': {'column_id': 'SYM'}, 'textAlign': 'left',
-             'fontWeight': '700', 'color': '#1a5c2a'},
+            {'if': {'column_id': 'SYM'}, 'textAlign': 'left', 'fontWeight': '700',
+             'color': '#1a5c2a'},
             {'if': {'column_id': 'DIR'}, 'textAlign': 'center'},
         ],
-        style_header={
-            'backgroundColor': '#1a5c2a', 'color': '#fff',
-            'fontWeight': '700', 'fontSize': '9px', 'textAlign': 'center'
-        },
+        style_header={'backgroundColor': '#1a5c2a', 'color': '#fff', 'fontWeight': '700',
+                      'fontSize': '9px', 'textAlign': 'center'},
         style_data_conditional=[
             {'if': {'filter_query': '{DIR} = "LONG"', 'column_id': 'DIR'},
              'color': '#1a8c3a', 'fontWeight': 'bold'},
             {'if': {'filter_query': '{DIR} = "SHORT"', 'column_id': 'DIR'},
              'color': '#cc2200', 'fontWeight': 'bold'},
             {'if': {'filter_query': '{STS} >= 10'}, 'backgroundColor': '#e8f5e9'},
-            {'if': {'filter_query': '{STS} >= 7 && {STS} < 10'},
-             'backgroundColor': '#f1f8e9'},
+            {'if': {'filter_query': '{STS} >= 7 && {STS} < 10'}, 'backgroundColor': '#f1f8e9'},
             {'if': {'column_id': 'PRICE'}, 'color': '#0055aa', 'fontWeight': '600'},
             {'if': {'column_id': 'TP'}, 'color': '#1a8c3a'},
             {'if': {'column_id': 'SL'}, 'color': '#cc2200'},
@@ -956,36 +849,43 @@ app.layout = html.Div([
              'backgroundColor': '#4caf50', 'color': '#fff'},
             {'if': {'row_index': 'odd'}, 'backgroundColor': '#f0ebe0'},
         ]),
+
+    # Footer
+    html.Div("© 2026 Truth Communications LLC • STASIS AM",
+             className="text-center", style={'fontSize': '8px', 'color': '#888',
+                                              'padding': '4px'}),
 ], style={'background': '#f5f0e8', 'minHeight': '100vh'})
 
 
+# ============================================================================
+# CALLBACKS
+# ============================================================================
+
+
 @app.callback(Output('status', 'children'), Input('tick', 'n_intervals'))
-def am_status(n):
+def update_status(n):
     if not manager.backfill_complete:
         return html.Span(f"⏳ Initializing... {manager.backfill_progress}%",
                          style={'color': '#aa6600'})
     st = price_feed.get_status()
     am_data = manager.get_am_data()
     tradable = sum(1 for d in am_data if d.get('is_tradable'))
-    total = len(am_data)
     if st['connected'] == 0:
-        return html.Span(
-            f"🔴 Connecting... | {total} streams | {tradable} tradable",
-            style={'color': '#aa6600'})
+        return html.Span(f"🔴 Connecting... | {tradable} tradable",
+                         style={'color': '#aa6600'})
     return html.Span(
         f"🟢 LIVE {st['connected']}/{st['total']} | "
         f"📨 {st['messages']:,} msgs | "
         f"📊 {len(config.fundamental_slopes)} fundamentals | "
-        f"🎯 {tradable} tradable signals",
-        style={'color': '#1a5c2a'}
-    )
+        f"🎯 {tradable} tradable",
+        style={'color': '#1a5c2a'})
 
 
 @app.callback(
     [Output('f-all', 'active'), Output('f-trad', 'active'), Output('fmode', 'data')],
     [Input('f-all', 'n_clicks'), Input('f-trad', 'n_clicks')],
     prevent_initial_call=True)
-def am_filter(n1, n2):
+def toggle_filter(n1, n2):
     ctx = callback_context
     if 'f-all' in ctx.triggered[0]['prop_id']:
         return True, False, 'all'
@@ -996,7 +896,7 @@ def am_filter(n1, n2):
     Output('tbl', 'data'),
     [Input('tick', 'n_intervals'), Input('fmode', 'data'),
      Input('f-dir', 'value'), Input('f-sort', 'value')])
-def am_table(n, fm, fd, fs):
+def update_table(n, fm, fd, fs):
     if not manager.backfill_complete:
         return []
     data = manager.get_am_data()
@@ -1028,10 +928,8 @@ def am_table(n, fm, fd, fs):
             'SL': f"${d['stop_loss']:.2f}" if d.get('stop_loss') else '—',
             'R:R': fmt_rr(d.get('risk_reward')),
             'DUR': d.get('stasis_duration_str', '—'),
-            '_tms': d.get('tms', 0),
-            '_fms': d.get('fms', 0),
-            '_stasis': d['stasis'],
-            '_52w': w52 if w52 is not None else 999,
+            '_tms': d.get('tms', 0), '_fms': d.get('fms', 0),
+            '_stasis': d['stasis'], '_52w': w52 if w52 is not None else 999,
         })
     if not rows:
         return []
@@ -1043,61 +941,18 @@ def am_table(n, fm, fd, fs):
     return df.to_dict('records')
 
 
-# Symbol selection API - called by clientside callback and desktop app
-app.clientside_callback(
-    """function(rows, data) {
-        if (!rows || !rows.length || !data) return '';
-        var sym = data[rows[0]]['SYM'];
-        if (sym) {
-            fetch('/api/symbol/' + sym);
-            // Notify parent window (desktop app) if embedded
-            try {
-                if (window.parent && window.parent !== window) {
-                    window.parent.postMessage({type: 'symbolSelected', symbol: sym}, '*');
-                }
-            } catch(e) {}
-        }
-        return sym;
-    }""",
-    Output('status', 'title'),
-    Input('tbl', 'selected_rows'), State('tbl', 'data'),
-    prevent_initial_call=True)
-
-
-@server.route('/api/symbol/<symbol>')
-def set_symbol_api(symbol):
-    set_selected_symbol(symbol)
-    return json.dumps({'ok': True, 'symbol': symbol})
-
-
-@server.route('/api/symbol')
-def get_symbol_api():
-    sym = get_selected_symbol()
-    return json.dumps({'symbol': sym})
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
 
 
 @server.route('/api/health')
-def health_check():
+def health():
     return json.dumps({
-        'status': 'ok',
-        'app': 'stasis_am',
+        'status': 'ok', 'app': 'stasis_am',
         'initialized': manager.initialized,
         'backfill_complete': manager.backfill_complete,
         'backfill_progress': manager.backfill_progress,
-        'stream_count': manager.stream_count,
-        'tradable_count': manager.tradable_count,
-        'price_feed': price_feed.get_status(),
-        'fundamentals': len(config.fundamental_slopes),
-    })
-
-
-@server.route('/api/status')
-def status_api():
-    return json.dumps({
-        'backfill_complete': manager.backfill_complete,
-        'backfill_progress': manager.backfill_progress,
-        'tradable_count': manager.tradable_count,
-        'price_feed': price_feed.get_status(),
     })
 
 
@@ -1106,40 +961,39 @@ def status_api():
 # ============================================================================
 
 _init_done = False
+_init_lock = threading.Lock()
 
 
-def initialize_data():
+def initialize():
     global _init_done
-    if _init_done:
-        return
-    print("=" * 70)
-    print("  STASIS AM SERVER v2.1")
-    print("  © 2026 Truth Communications LLC")
-    print("=" * 70)
-    print(f"\n🎯 {len(config.symbols)} symbols to process\n")
-
-    config.week52_data = fetch_52_week_data()
-    config.volumes = fetch_volume_data()
-    fetch_all_fundamental_data()
-    manager.backfill()
-    price_feed.start()
-    manager.start()
-
-    print(f"\n✅ STASIS AM READY")
-    print(f"   Fundamentals: {len(config.fundamental_slopes)}")
-    print(f"   Streams: {manager.stream_count}")
-    print(f"   Tradable: {manager.tradable_count}")
-    _init_done = True
+    with _init_lock:
+        if _init_done:
+            return
+        print("=" * 70)
+        print("  STASIS AM SERVER")
+        print("  © 2026 Truth Communications LLC")
+        print("=" * 70)
+        print(f"\n🎯 Symbols: {len(config.symbols)}")
+        config.week52_data = fetch_52_week_data()
+        config.volumes = fetch_volume_data()
+        fetch_all_fundamental_data()
+        manager.backfill()
+        price_feed.start()
+        manager.start()
+        print(f"\n✅ READY — {len(config.fundamental_slopes)} fundamentals")
+        print("=" * 70)
+        _init_done = True
 
 
-# Start initialization in background thread
-init_thread = threading.Thread(target=initialize_data, daemon=True)
-init_thread.start()
+_init_thread = threading.Thread(target=initialize, daemon=True)
+_init_thread.start()
 
 # ============================================================================
-# MAIN ENTRY POINT
+# MAIN
 # ============================================================================
 
 if __name__ == '__main__':
-    print(f"\n🚀 LAUNCHING STASIS AM SERVER on {HOST}:{PORT}\n")
-    app.run(debug=False, host=HOST, port=PORT, use_reloader=False)
+    _init_thread.join()
+    port = int(os.environ.get('PORT', 8050))
+    print(f"\n🟢 http://0.0.0.0:{port}\n")
+    app.run(debug=False, host='0.0.0.0', port=port)
