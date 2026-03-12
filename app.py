@@ -1454,7 +1454,7 @@ app.layout = html.Div([
                 id='msi-lookback',
                 options=[{'label': f'{d} Days', 'value': d}
                          for d in config.msi_lookback_options],
-                value=_default_lookback,
+                value=config.msi_default_lookback,
                 clearable=False,
                 style={'width': '110px', 'fontSize': '10px',
                        'display': 'inline-block'}),
