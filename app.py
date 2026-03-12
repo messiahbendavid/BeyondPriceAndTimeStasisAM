@@ -108,16 +108,13 @@ class Config:
         0.04, 0.05
     ])
     # --- MSI config ---
-    msi_sample_symbols: List[str] = field(default_factory=lambda: [
-        "SPY", "AAPL", "MSFT", "AMZN", "NVDA",
-        "TSLA", "GOOGL", "META", "JPM", "BAC",
-    ])
+    msi_sample_symbols: List[str] = field(default_factory=lambda: [])
     msi_default_threshold: float = 0.01
     msi_default_lookback: int = 90
     msi_lookback_options: List[int] = field(
         default_factory=lambda: [30, 60, 90, 180, 365])
     msi_threshold_options: List[float] = field(
-        default_factory=lambda: [0.005, 0.01, 0.015, 0.02, 0.025])
+        default_factory=lambda: [0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05])
 
     update_interval_ms: int = 1000
     cache_refresh_interval: float = 0.5
@@ -136,7 +133,7 @@ class Config:
 
 config = Config()
 config.symbols = list(dict.fromkeys(config.symbols))
-
+config.msi_sample_symbols = list(config.symbols)
 # ============================================================================
 # ENUMS & DATA CLASSES
 # ============================================================================
@@ -284,7 +281,7 @@ class MarketStasisIndex:
                 fail += 1
         self.data_fetched = True
         print(f"✅ MSI daily data: {ok} ok, {fail} failed "
-              f"({len(config.msi_sample_symbols)} requested)\n")
+              f"({len(_sample_symbols)} requested)\n")
 
     # --------------------------------------------------------- core bitstream
     @staticmethod
@@ -1456,8 +1453,8 @@ app.layout = html.Div([
             dcc.Dropdown(
                 id='msi-lookback',
                 options=[{'label': f'{d} Days', 'value': d}
-                         for d in config.msi_lookback_options],
-                value=config.msi_default_lookback,
+                         for d in _lookback_options],
+                value=_default_lookback,
                 clearable=False,
                 style={'width': '110px', 'fontSize': '10px',
                        'display': 'inline-block'}),
@@ -1468,13 +1465,13 @@ app.layout = html.Div([
             dcc.Dropdown(
                 id='msi-threshold',
                 options=[{'label': f'{t*100:.1f}%', 'value': t}
-                         for t in config.msi_threshold_options],
-                value=config.msi_default_threshold,
+                         for t in _threshold_options],
+                value=_default_threshold,
                 clearable=False,
                 style={'width': '90px', 'fontSize': '10px',
                        'display': 'inline-block'}),
             html.Span(
-                f"  Sample: {', '.join(config.msi_sample_symbols)}",
+                f"  Sample: {', '.join(_sample_symbols)}",
                 style={'fontSize': '9px', 'color': '#888',
                        'marginLeft': '16px'}),
         ], className="d-flex align-items-center",
@@ -1681,8 +1678,8 @@ def update_msi_panel(n, lookback, threshold):
     if not msi_engine.data_fetched:
         return empty_kpi, empty_fig, empty_comp
 
-    lookback = lookback or config.msi_default_lookback
-    threshold = threshold or config.msi_default_threshold
+    lookback = lookback or _default_lookback
+    threshold = threshold or _default_threshold
 
     # Compute historical MSI
     history = msi_engine.compute(threshold, lookback)
