@@ -1453,7 +1453,7 @@ app.layout = html.Div([
             dcc.Dropdown(
                 id='msi-lookback',
                 options=[{'label': f'{d} Days', 'value': d}
-                         for d in _lookback_options],
+                         for d in config.msi_lookback_options],
                 value=_default_lookback,
                 clearable=False,
                 style={'width': '110px', 'fontSize': '10px',
@@ -1465,7 +1465,7 @@ app.layout = html.Div([
             dcc.Dropdown(
                 id='msi-threshold',
                 options=[{'label': f'{t*100:.1f}%', 'value': t}
-                         for t in _threshold_options],
+                         for t in config.msi_threshold_options],
                 value=_default_threshold,
                 clearable=False,
                 style={'width': '90px', 'fontSize': '10px',
