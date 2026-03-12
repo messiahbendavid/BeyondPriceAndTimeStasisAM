@@ -240,6 +240,7 @@ class MarketStasisIndex:
 
     def __init__(self):
         self.daily_closes: Dict[str, List[Tuple[str, float]]] = {}
+        self.vix_data: Dict[str, float] = {}
         self._cache: Dict[Tuple[float, int], List[Dict]] = {}
         self._cache_lock = threading.Lock()
         self.data_fetched = False
@@ -282,6 +283,124 @@ class MarketStasisIndex:
         self.data_fetched = True
         print(f"✅ MSI daily data: {ok} ok, {fail} failed "
               f"({len(config.msi_sample_symbols)} requested)\n")
+    def fetch_vix(self, max_calendar_days=400):
+        """Fetch VIX daily closes. Tries index first, then ETF proxies."""
+        print("📈 MSI — Fetching VIX data…")
+        end = datetime.now()
+        start = end - timedelta(days=max_calendar_days)
+        for ticker in ['I:VIX', 'VIXY', 'VXX', 'UVXY']:
+            try:
+                url = (
+                    f"{config.polygon_rest_url}/v2/aggs/ticker/{ticker}"
+                    f"/range/1/day/"
+                    f"{start.strftime('%Y-%m-%d')}/"
+                    f"{end.strftime('%Y-%m-%d')}"
+                    f"?adjusted=true&sort=asc&limit=5000"
+                    f"&apiKey={config.polygon_api_key}")
+                r = requests.get(url, timeout=15)
+                if r.status_code == 200:
+                    results = r.json().get('results', [])
+                    if results and len(results) > 30:
+                        self.vix_data = {
+                            datetime.fromtimestamp(
+                                b['t'] / 1000).strftime('%Y-%m-%d'):
+                            b['c'] for b in results}
+                        print(f"✅ VIX data: {len(self.vix_data)} "
+                              f"days from {ticker}")
+                        return
+            except Exception as exc:
+                print(f"  ⚠ VIX fetch {ticker}: {exc}")
+            time.sleep(0.15)
+        print("⚠ Could not fetch VIX data from any source")
+
+    def compute_lead_lag(self, threshold=0.05, lookback=90,
+                         max_lag=15):
+        """Cross-correlation between MSI and VIX at various lags.
+        Positive lag = MSI leads VIX by that many days."""
+        history = self.compute(threshold, lookback)
+        if not history or not self.vix_data:
+            return None
+
+        # Align by date
+        msi_vals, vix_vals = [], []
+        for h in history:
+            vix = self.vix_data.get(h['date'])
+            if vix is not None:
+                msi_vals.append(h['msi'])
+                vix_vals.append(vix)
+        if len(msi_vals) < 25:
+            return None
+
+        msi_a = np.array(msi_vals, dtype=float)
+        vix_a = np.array(vix_vals, dtype=float)
+
+        # --- 1. Level cross-correlation ---
+        level_corr = {}
+        for lag in range(-max_lag, max_lag + 1):
+            if lag >= 0:
+                m = msi_a[:len(msi_a) - lag] if lag else msi_a
+                v = vix_a[lag:] if lag else vix_a
+            else:
+                m = msi_a[-lag:]
+                v = vix_a[:len(vix_a) + lag]
+            if len(m) >= 15 and np.std(m) > 1e-9 and np.std(v) > 1e-9:
+                level_corr[lag] = round(
+                    float(np.corrcoef(m, v)[0, 1]), 4)
+
+        # --- 2. Change cross-correlation ---
+        msi_chg = np.diff(msi_a)
+        vix_chg = np.diff(vix_a)
+        change_corr = {}
+        for lag in range(-max_lag, max_lag + 1):
+            if lag >= 0:
+                mc = msi_chg[:len(msi_chg) - lag] if lag else msi_chg
+                vc = vix_chg[lag:] if lag else vix_chg
+            else:
+                mc = msi_chg[-lag:]
+                vc = vix_chg[:len(vix_chg) + lag]
+            if (len(mc) >= 15
+                    and np.std(mc) > 1e-9 and np.std(vc) > 1e-9):
+                change_corr[lag] = round(
+                    float(np.corrcoef(mc, vc)[0, 1]), 4)
+
+        # --- 3. Predictive: high-MSI vs low-MSI forward VIX move ---
+        med = float(np.median(msi_a))
+        predictive = {}
+        for fwd in [1, 3, 5, 10]:
+            hi_chg, lo_chg = [], []
+            for i in range(len(msi_a) - fwd):
+                dv = float(vix_a[i + fwd] - vix_a[i])
+                if msi_a[i] > med:
+                    hi_chg.append(dv)
+                else:
+                    lo_chg.append(dv)
+            if hi_chg and lo_chg:
+                predictive[fwd] = {
+                    'high_msi_avg': round(np.mean(hi_chg), 3),
+                    'low_msi_avg': round(np.mean(lo_chg), 3),
+                    'edge': round(
+                        np.mean(hi_chg) - np.mean(lo_chg), 3)}
+
+        # --- Best leads ---
+        result = {
+            'level_corr': level_corr,
+            'change_corr': change_corr,
+            'predictive': predictive,
+            'n_days': len(msi_vals),
+            'best_level_lag': None,
+            'best_level_r': None,
+            'best_change_lag': None,
+            'best_change_r': None,
+        }
+        if level_corr:
+            bl = max(level_corr.items(), key=lambda x: abs(x[1]))
+            result['best_level_lag'] = bl[0]
+            result['best_level_r'] = bl[1]
+        if change_corr:
+            bc = max(change_corr.items(), key=lambda x: abs(x[1]))
+            result['best_change_lag'] = bc[0]
+            result['best_change_r'] = bc[1]
+        return result
 
     # --------------------------------------------------------- core bitstream
     @staticmethod
@@ -316,24 +435,40 @@ class MarketStasisIndex:
             else:
                 break
         return cnt
-
+    @staticmethod
+    def _bitstream_stasis_series(closes, threshold):
+        """Run bitstream once through full series, return stasis at
+        each day.  O(n) instead of O(n*lookback)."""
+        if not closes:
+            return []
+        if len(closes) == 1:
+            return [0]
+        ref = closes[0]
+        bits = []
+        result = [0]
+        for price in closes[1:]:
+            bw = threshold * ref
+            if bw > 0 and not (ref - bw < price < ref + bw):
+                x = int((price - ref) / bw)
+                if x > 0:
+                    bits.extend([1] * x); ref = price
+                elif x < 0:
+                    bits.extend([0] * abs(x)); ref = price
+            if len(bits) < 2:
+                result.append(len(bits))
+            else:
+                cnt = 1
+                for i in range(len(bits) - 1, 0, -1):
+                    if bits[i] != bits[i - 1]:
+                        cnt += 1
+                    else:
+                        break
+                result.append(cnt)
+        return result
     # ------------------------------------------------------ compute full MSI
-    def compute(
-            self,
-            threshold: float = 0.01,
-            lookback: int = 90) -> List[Dict]:
-        """Return list of dicts, one per trading day, oldest first.
-
-        Each dict::
-
-            { 'date': '2024-06-12',
-              'msi': 3.40,
-              'breadth': 60.0,
-              'peak': 7,
-              'dispersion': 1.23,
-              'components': {'SPY': 4, 'AAPL': 3, …},
-              'num_stocks': 10 }
-        """
+    def compute(self, threshold=0.05, lookback=90):
+        """MSI = grand sum of stasis across ALL stocks × ALL bands
+        up to *threshold*.  Lookback controls display window."""
         key = (threshold, lookback)
         with self._cache_lock:
             if key in self._cache:
@@ -342,98 +477,129 @@ class MarketStasisIndex:
         if not self.data_fetched or not self.daily_closes:
             return []
 
-        # ---- per-symbol stasis series (keyed by date) --------------------
-        sym_stasis: Dict[str, Dict[str, int]] = {}
+        # All band levels up to the selected max
+        bands = sorted(
+            [t for t in config.msi_threshold_options if t <= threshold])
+        if not bands:
+            bands = [threshold]
+
+        # One forward pass per (symbol, band) — fast
+        # grid[sym][band] = {date: stasis}
+        grid = {}
         for sym, series in self.daily_closes.items():
             closes = [c for _, c in series]
             dates = [d for d, _ in series]
-            stasis_by_date: Dict[str, int] = {}
-            for i in range(len(closes)):
-                win_start = max(0, i - lookback + 1)
-                window = closes[win_start: i + 1]
-                s = self._bitstream_final_stasis(window, threshold)
-                stasis_by_date[dates[i]] = s
-            sym_stasis[sym] = stasis_by_date
+            grid[sym] = {}
+            for band in bands:
+                ss = self._bitstream_stasis_series(closes, band)
+                grid[sym][band] = dict(zip(dates, ss))
 
-        # ---- aggregate by date -------------------------------------------
-        all_dates: set = set()
-        for sbd in sym_stasis.values():
-            all_dates.update(sbd.keys())
-        all_dates_sorted = sorted(all_dates)
+        # All unique dates
+        all_dates = set()
+        for sym_d in grid.values():
+            for bd in sym_d.values():
+                all_dates.update(bd.keys())
+        all_dates = sorted(all_dates)
 
-        history: List[Dict] = []
-        for dt in all_dates_sorted:
-            vals: Dict[str, int] = {}
-            for sym, sbd in sym_stasis.items():
-                if dt in sbd:
-                    vals[sym] = sbd[dt]
-            if not vals:
-                continue
-            arr = list(vals.values())
-            n = len(arr)
-            msi_val = sum(arr) / n
-            breadth = sum(1 for v in arr if v >= 3) / n * 100
-            peak = max(arr)
-            disp = float(np.std(arr)) if n > 1 else 0.0
+        # Lookback = display window
+        cutoff = (datetime.now()
+                  - timedelta(days=lookback)).strftime('%Y-%m-%d')
+        display_dates = [d for d in all_dates if d >= cutoff]
+
+        # Build daily MSI
+        history = []
+        for dt in display_dates:
+            total = 0
+            all_vals = []
+            stock_totals = {}
+            band_totals = {b: 0 for b in bands}
+
+            for sym in grid:
+                sym_total = 0
+                for band in bands:
+                    s = grid[sym].get(band, {}).get(dt, 0)
+                    total += s
+                    all_vals.append(s)
+                    sym_total += s
+                    band_totals[band] += s
+                stock_totals[sym] = sym_total
+
+            n_pairs = len(all_vals) or 1
+            breadth = (sum(1 for v in all_vals if v >= 3)
+                       / n_pairs * 100)
+            peak = max(all_vals) if all_vals else 0
+            disp = (float(np.std(all_vals))
+                    if len(all_vals) > 1 else 0.0)
+
             history.append({
                 'date': dt,
-                'msi': round(msi_val, 2),
+                'msi': total,
+                'vix': self.vix_data.get(dt),
                 'breadth': round(breadth, 1),
                 'peak': peak,
                 'dispersion': round(disp, 2),
-                'components': vals,
-                'num_stocks': n,
+                'components': stock_totals,
+                'band_breakdown': {
+                    f"{b*100:.1f}%": v
+                    for b, v in band_totals.items()},
+                'num_stocks': len(grid),
+                'num_bands': len(bands),
             })
 
         with self._cache_lock:
             self._cache[key] = history
         return history
-
     # --------------------------------------------------- live MSI estimate
-    def live_estimate(
-            self,
-            live_prices: Dict[str, float],
-            threshold: float = 0.01,
-            lookback: int = 90) -> Optional[Dict]:
-        """Compute a *right-now* MSI by appending the latest live price
-        to each symbol's daily series and computing stasis."""
+    def live_estimate(self, live_prices, threshold=0.05, lookback=90):
+        """Live MSI using current websocket prices."""
         if not self.data_fetched or not self.daily_closes:
             return None
+
+        bands = sorted(
+            [t for t in config.msi_threshold_options if t <= threshold])
+        if not bands:
+            bands = [threshold]
+
         today = datetime.now().strftime('%Y-%m-%d')
-        vals: Dict[str, int] = {}
+        total = 0
+        all_vals = []
+        stock_totals = {}
+
         for sym, series in self.daily_closes.items():
-            lp = live_prices.get(sym)
-            if lp is None:
-                # fall back to last daily close
-                if series:
-                    lp = series[-1][1]
-                else:
-                    continue
-            # build window: last lookback-1 daily closes + today's live
             closes = [c for _, c in series]
-            dates = [d for d, _ in series]
-            # if today already present, replace; else append
-            if dates and dates[-1] == today:
-                closes[-1] = lp
-            else:
-                closes.append(lp)
-            window = closes[-(lookback):]
-            s = self._bitstream_final_stasis(window, threshold)
-            vals[sym] = s
-        if not vals:
+            lp = live_prices.get(sym)
+            if lp is not None:
+                dates = [d for d, _ in series]
+                if dates and dates[-1] == today:
+                    closes[-1] = lp
+                else:
+                    closes.append(lp)
+            elif not closes:
+                continue
+
+            sym_total = 0
+            for band in bands:
+                s = self._bitstream_final_stasis(closes, band)
+                total += s
+                all_vals.append(s)
+                sym_total += s
+            stock_totals[sym] = sym_total
+
+        if not all_vals:
             return None
-        arr = list(vals.values())
-        n = len(arr)
+        n = len(all_vals) or 1
         return {
             'date': today,
-            'msi': round(sum(arr) / n, 2),
+            'msi': total,
+            'vix': self.vix_data.get(today),
             'breadth': round(
-                sum(1 for v in arr if v >= 3) / n * 100, 1),
-            'peak': max(arr),
+                sum(1 for v in all_vals if v >= 3) / n * 100, 1),
+            'peak': max(all_vals),
             'dispersion': round(
-                float(np.std(arr)) if n > 1 else 0.0, 2),
-            'components': vals,
-            'num_stocks': n,
+                float(np.std(all_vals)) if n > 1 else 0.0, 2),
+            'components': stock_totals,
+            'num_stocks': len(stock_totals),
+            'num_bands': len(bands),
         }
 
     def invalidate_cache(self):
@@ -1458,7 +1624,7 @@ app.layout = html.Div([
                 clearable=False,
                 style={'width': '110px', 'fontSize': '10px',
                        'display': 'inline-block'}),
-            html.Label("Band Threshold:",
+            html.Label("Max Band:",
                        style={'fontSize': '10px', 'fontWeight': '600',
                               'marginLeft': '16px',
                               'marginRight': '4px', 'color': '#333'}),
@@ -1485,7 +1651,7 @@ app.layout = html.Div([
         # MSI chart
         dcc.Graph(id='msi-chart',
                   config={'displayModeBar': False},
-                  style={'height': '280px', 'padding': '0 8px'}),
+                  style={'height': '420px', 'padding': '0 8px'}),
 
         # MSI component table
         html.Div(id='msi-components',
@@ -1664,7 +1830,7 @@ def update_status(n):
 def update_msi_panel(n, lookback, threshold):
     empty_fig = go.Figure()
     empty_fig.update_layout(
-        margin=dict(l=40, r=20, t=10, b=30),
+        margin=dict(l=40, r=40, t=10, b=30),
         paper_bgcolor='#faf7f0', plot_bgcolor='#faf7f0',
         xaxis=dict(visible=False), yaxis=dict(visible=False),
         annotations=[dict(
@@ -1681,14 +1847,13 @@ def update_msi_panel(n, lookback, threshold):
     lookback = lookback or config.msi_default_lookback
     threshold = threshold or config.msi_default_threshold
 
-    # Compute historical MSI
     history = msi_engine.compute(threshold, lookback)
     if not history:
         return empty_kpi, empty_fig, empty_comp
 
-    # Live estimate
     live_prices = price_feed.get_prices()
     live = msi_engine.live_estimate(live_prices, threshold, lookback)
+    lead_lag = msi_engine.compute_lead_lag(threshold, lookback)
 
     # --------------- KPI row -----------------------------------------------
     latest = live if live else history[-1]
@@ -1696,14 +1861,14 @@ def update_msi_panel(n, lookback, threshold):
     breadth = latest['breadth']
     peak = latest['peak']
     disp = latest['dispersion']
-    n_stocks = latest['num_stocks']
 
     # 5-day trend
     trend_arrow = "—"
     if len(history) >= 6:
         recent = [h['msi'] for h in history[-5:]]
-        older = [h['msi'] for h in history[-10:-5]] if len(
-            history) >= 10 else [h['msi'] for h in history[:5]]
+        older = ([h['msi'] for h in history[-10:-5]]
+                 if len(history) >= 10
+                 else [h['msi'] for h in history[:5]])
         diff = np.mean(recent) - np.mean(older)
         if diff > 0.3:
             trend_arrow = "📈 Rising"
@@ -1712,23 +1877,48 @@ def update_msi_panel(n, lookback, threshold):
         else:
             trend_arrow = "➡️ Stable"
 
-    # Zone label
-    if msi_val >= 5:
-        zone = ("🟢 HIGH STASIS", "#1a8c3a")
-    elif msi_val >= 3:
-        zone = ("🟡 MODERATE", "#cc8800")
-    else:
-        zone = ("🔴 LOW / TRENDING", "#cc2200")
+    # Lead/lag KPI
+    lead_kpi_text = "—"
+    lead_kpi_color = "#888"
+    if lead_lag:
+        bl = lead_lag.get('best_level_lag')
+        br = lead_lag.get('best_level_r')
+        if bl is not None and br is not None:
+            direction = "LEADS" if bl > 0 else (
+                "LAGS" if bl < 0 else "SYNC")
+            lead_kpi_text = (f"{direction} {abs(bl)}d "
+                             f"(r={br:+.3f})")
+            lead_kpi_color = ("#1a8c3a" if bl > 0
+                              else "#cc2200" if bl < 0
+                              else "#0055aa")
+
+    # Predictive edge KPI
+    pred_text = "—"
+    if lead_lag and lead_lag.get('predictive'):
+        p5 = lead_lag['predictive'].get(5)
+        if p5:
+            edge = p5['edge']
+            pred_text = (f"{'↑' if edge > 0 else '↓'}"
+                         f"{abs(edge):.2f} VIX pts/5d")
+
+    # VIX current
+    vix_now = latest.get('vix')
+    vix_text = f"{vix_now:.2f}" if vix_now else "—"
 
     kpi_row = html.Div([
         html.Div([
-            html.Div(f"{msi_val:.2f}", className="msi-kpi-val"),
-            html.Div("MSI LEVEL", className="msi-kpi-lbl"),
+            html.Div(f"{msi_val:,.0f}", className="msi-kpi-val"),
+            html.Div("MSI TOTAL", className="msi-kpi-lbl"),
+        ], className="msi-kpi"),
+        html.Div([
+            html.Div(vix_text, className="msi-kpi-val",
+                     style={'color': '#cc2200'}),
+            html.Div("VIX", className="msi-kpi-lbl"),
         ], className="msi-kpi"),
         html.Div([
             html.Div(f"{breadth:.0f}%", className="msi-kpi-val",
                      style={'color': '#0055aa'}),
-            html.Div("BREADTH (≥3)", className="msi-kpi-lbl"),
+            html.Div("BREADTH ≥3", className="msi-kpi-lbl"),
         ], className="msi-kpi"),
         html.Div([
             html.Div(str(peak), className="msi-kpi-val",
@@ -1736,20 +1926,21 @@ def update_msi_panel(n, lookback, threshold):
             html.Div("PEAK", className="msi-kpi-lbl"),
         ], className="msi-kpi"),
         html.Div([
-            html.Div(f"{disp:.2f}", className="msi-kpi-val",
-                     style={'color': '#666'}),
-            html.Div("DISPERSION", className="msi-kpi-lbl"),
-        ], className="msi-kpi"),
-        html.Div([
             html.Div(trend_arrow, style={
                 'fontSize': '13px', 'fontWeight': '600'}),
-            html.Div("5-DAY TREND", className="msi-kpi-lbl"),
+            html.Div("5D TREND", className="msi-kpi-lbl"),
         ], className="msi-kpi"),
         html.Div([
-            html.Div(zone[0], style={
-                'fontSize': '12px', 'fontWeight': '700',
-                'color': zone[1]}),
-            html.Div("ZONE", className="msi-kpi-lbl"),
+            html.Div(lead_kpi_text, style={
+                'fontSize': '11px', 'fontWeight': '700',
+                'color': lead_kpi_color}),
+            html.Div("MSI→VIX LAG", className="msi-kpi-lbl"),
+        ], className="msi-kpi"),
+        html.Div([
+            html.Div(pred_text, style={
+                'fontSize': '11px', 'fontWeight': '600',
+                'color': '#8b4513'}),
+            html.Div("HIGH-MSI EDGE", className="msi-kpi-lbl"),
         ], className="msi-kpi"),
     ])
 
@@ -1757,58 +1948,49 @@ def update_msi_panel(n, lookback, threshold):
     dates = [h['date'] for h in history]
     msi_vals = [h['msi'] for h in history]
     breadth_vals = [h['breadth'] for h in history]
-    disp_vals = [h['dispersion'] for h in history]
+    vix_vals = [h.get('vix') for h in history]
+    has_vix = any(v is not None for v in vix_vals)
 
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.7, 0.3],
-        vertical_spacing=0.06)
+        rows=3, cols=1, shared_xaxes=True,
+        row_heights=[0.55, 0.25, 0.20],
+        vertical_spacing=0.04,
+        specs=[[{"secondary_y": True}],
+               [{"secondary_y": False}],
+               [{"secondary_y": False}]])
 
-    # --- Background zone shading on row 1 ---
-    fig.add_hrect(
-        y0=5, y1=20, fillcolor="rgba(26,140,58,0.08)",
-        line_width=0, row=1, col=1)
-    fig.add_hrect(
-        y0=3, y1=5, fillcolor="rgba(204,136,0,0.06)",
-        line_width=0, row=1, col=1)
-    fig.add_hrect(
-        y0=0, y1=3, fillcolor="rgba(204,34,0,0.05)",
-        line_width=0, row=1, col=1)
-
-    # MSI line
+    # Row 1: MSI line
     fig.add_trace(go.Scatter(
         x=dates, y=msi_vals,
         mode='lines', name='MSI',
         line=dict(color='#1a5c2a', width=2.5),
         fill='tozeroy',
-        fillcolor='rgba(26,92,42,0.10)'),
-        row=1, col=1)
+        fillcolor='rgba(26,92,42,0.08)'),
+        row=1, col=1, secondary_y=False)
 
-    # Zone reference lines
-    fig.add_hline(y=5, line_dash="dot",
-                  line_color="rgba(26,140,58,0.4)",
-                  annotation_text="High",
-                  annotation_position="top left",
-                  annotation_font_size=8,
-                  row=1, col=1)
-    fig.add_hline(y=3, line_dash="dot",
-                  line_color="rgba(204,136,0,0.4)",
-                  annotation_text="Moderate",
-                  annotation_position="top left",
-                  annotation_font_size=8,
-                  row=1, col=1)
+    # Row 1: VIX overlay (secondary y)
+    if has_vix:
+        vix_clean_dates = [d for d, v in zip(dates, vix_vals)
+                           if v is not None]
+        vix_clean_vals = [v for v in vix_vals if v is not None]
+        fig.add_trace(go.Scatter(
+            x=vix_clean_dates, y=vix_clean_vals,
+            mode='lines', name='VIX',
+            line=dict(color='#cc2200', width=1.8, dash='dot'),
+            opacity=0.8),
+            row=1, col=1, secondary_y=True)
 
-    # Live MSI point
+    # Live MSI marker
     if live:
         fig.add_trace(go.Scatter(
             x=[live['date']], y=[live['msi']],
-            mode='markers', name='Live',
+            mode='markers', name='Live MSI',
             marker=dict(color='#e65100', size=10,
                         symbol='diamond',
                         line=dict(width=2, color='#fff'))),
-            row=1, col=1)
+            row=1, col=1, secondary_y=False)
 
-    # Breadth bars on row 2
+    # Row 2: Breadth
     bar_colors = ['#1a8c3a' if b >= 60
                   else '#cc8800' if b >= 30
                   else '#cc2200'
@@ -1820,54 +2002,114 @@ def update_msi_panel(n, lookback, threshold):
     fig.add_hline(y=50, line_dash="dot",
                   line_color="rgba(0,0,0,0.2)", row=2, col=1)
 
+    # Row 3: Lead/lag correlation bars
+    if lead_lag and lead_lag.get('level_corr'):
+        lc = lead_lag['level_corr']
+        lags = sorted(lc.keys())
+        corrs = [lc[l] for l in lags]
+        bar_c = ['#1a8c3a' if l > 0 and c > 0
+                 else '#cc2200' if c < 0
+                 else '#888'
+                 for l, c in zip(lags, corrs)]
+        fig.add_trace(go.Bar(
+            x=[f"{l:+d}d" for l in lags], y=corrs,
+            name='MSI→VIX Corr',
+            marker_color=bar_c, opacity=0.8),
+            row=3, col=1)
+        fig.add_hline(y=0, line_color="rgba(0,0,0,0.3)",
+                      row=3, col=1)
+        # Mark where MSI leads (positive lag)
+        fig.add_vrect(
+            x0=f"{0:+d}d", x1=f"{max(lags):+d}d",
+            fillcolor="rgba(26,140,58,0.06)",
+            line_width=0, row=3, col=1)
+
     fig.update_layout(
-        margin=dict(l=45, r=15, t=8, b=25),
-        paper_bgcolor='#faf7f0',
-        plot_bgcolor='#faf7f0',
-        showlegend=False,
+        margin=dict(l=50, r=50, t=8, b=25),
+        paper_bgcolor='#faf7f0', plot_bgcolor='#faf7f0',
+        showlegend=True,
+        legend=dict(orientation='h', y=1.02, x=0.5,
+                    xanchor='center', font_size=9),
         font=dict(family='Consolas, monospace', size=9),
         hovermode='x unified')
-    fig.update_yaxes(title_text="MSI", row=1, col=1,
-                     gridcolor='rgba(0,0,0,0.06)')
-    fig.update_yaxes(title_text="Breadth %", row=2, col=1,
-                     range=[0, 105],
-                     gridcolor='rgba(0,0,0,0.06)')
+    fig.update_yaxes(
+        title_text="MSI (sum)", row=1, col=1,
+        secondary_y=False, gridcolor='rgba(0,0,0,0.06)')
+    if has_vix:
+        fig.update_yaxes(
+            title_text="VIX", row=1, col=1,
+            secondary_y=True, gridcolor='rgba(0,0,0,0)',
+            showgrid=False,
+            title_font_color='#cc2200',
+            tickfont_color='#cc2200')
+    fig.update_yaxes(
+        title_text="Breadth %", row=2, col=1,
+        range=[0, 105], gridcolor='rgba(0,0,0,0.06)')
+    fig.update_yaxes(
+        title_text="Corr", row=3, col=1,
+        range=[-1, 1], gridcolor='rgba(0,0,0,0.06)')
     fig.update_xaxes(gridcolor='rgba(0,0,0,0.06)')
 
-    # --------------- Component table ---------------------------------------
+    # --------------- Components + Lead/Lag details -------------------------
+    sections = []
+
+    # Component badges
     comp = latest.get('components', {})
     if comp:
-        sym_items = sorted(comp.items(),
-                           key=lambda x: x[1], reverse=True)
-        comp_cells = []
-        for sym, stasis in sym_items:
-            if stasis >= 5:
-                bg = '#c8e6c9'
-            elif stasis >= 3:
-                bg = '#fff9c4'
-            else:
-                bg = '#ffcdd2'
-            comp_cells.append(
-                html.Span(
-                    f"{sym}:{stasis}",
-                    style={
-                        'fontSize': '9px',
-                        'fontFamily': 'Consolas, monospace',
-                        'fontWeight': '600',
-                        'background': bg,
-                        'padding': '2px 6px',
-                        'borderRadius': '3px',
-                        'margin': '2px',
-                        'display': 'inline-block'}))
-        comp_div = html.Div([
-            html.Span("COMPONENTS: ",
+        top10 = sorted(comp.items(), key=lambda x: x[1],
+                        reverse=True)[:15]
+        cells = []
+        for sym, stasis in top10:
+            bg = ('#c8e6c9' if stasis >= 20
+                  else '#fff9c4' if stasis >= 10
+                  else '#ffcdd2')
+            cells.append(html.Span(
+                f"{sym}:{stasis}",
+                style={'fontSize': '9px',
+                       'fontFamily': 'Consolas, monospace',
+                       'fontWeight': '600', 'background': bg,
+                       'padding': '2px 6px', 'borderRadius': '3px',
+                       'margin': '2px',
+                       'display': 'inline-block'}))
+        sections.append(html.Div([
+            html.Span("TOP COMPONENTS: ",
                       style={'fontSize': '9px', 'fontWeight': '700',
                              'color': '#333', 'marginRight': '6px'}),
-            *comp_cells
-        ])
-    else:
-        comp_div = html.Span("")
+            *cells]))
 
+    # Predictive summary
+    if lead_lag and lead_lag.get('predictive'):
+        pred_cells = []
+        for fwd in [1, 3, 5, 10]:
+            p = lead_lag['predictive'].get(fwd)
+            if p:
+                edge = p['edge']
+                color = '#1a8c3a' if edge > 0 else '#cc2200'
+                pred_cells.append(html.Span(
+                    f"{fwd}d: {'+' if edge>0 else ''}"
+                    f"{edge:.2f}",
+                    style={'fontSize': '9px',
+                           'fontFamily': 'Consolas',
+                           'fontWeight': '600', 'color': color,
+                           'background': '#f5f0e8',
+                           'padding': '2px 6px',
+                           'borderRadius': '3px',
+                           'margin': '2px',
+                           'display': 'inline-block'}))
+        if pred_cells:
+            sections.append(html.Div([
+                html.Span("VIX EDGE (high MSI − low MSI): ",
+                          style={'fontSize': '9px',
+                                 'fontWeight': '700',
+                                 'color': '#8b4513',
+                                 'marginRight': '6px'}),
+                *pred_cells,
+                html.Span(
+                    f"  ({lead_lag['n_days']} days analyzed)",
+                    style={'fontSize': '8px', 'color': '#999'})
+            ], style={'marginTop': '4px'}))
+
+    comp_div = html.Div(sections) if sections else html.Span("")
     return kpi_row, fig, comp_div
 
 
@@ -2073,6 +2315,7 @@ def initialize():
 
         # ---- MSI daily data fetch (before long blocking steps) ----
         msi_engine.fetch_data(max_calendar_days=400)
+        msi_engine.fetch_vix(max_calendar_days=400)
 
         # Pre-compute MSI for all standard lookback/threshold combos
         if msi_engine.data_fetched:
