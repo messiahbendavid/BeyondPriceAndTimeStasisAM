@@ -1466,7 +1466,7 @@ app.layout = html.Div([
                 id='msi-threshold',
                 options=[{'label': f'{t*100:.1f}%', 'value': t}
                          for t in config.msi_threshold_options],
-                value=_default_threshold,
+                value=config.msi_default_threshold,
                 clearable=False,
                 style={'width': '90px', 'fontSize': '10px',
                        'display': 'inline-block'}),
