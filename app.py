@@ -281,7 +281,7 @@ class MarketStasisIndex:
                 fail += 1
         self.data_fetched = True
         print(f"✅ MSI daily data: {ok} ok, {fail} failed "
-              f"({len(_sample_symbols)} requested)\n")
+              f"({len(config.msi_sample_symbols)} requested)\n")
 
     # --------------------------------------------------------- core bitstream
     @staticmethod
@@ -1678,8 +1678,8 @@ def update_msi_panel(n, lookback, threshold):
     if not msi_engine.data_fetched:
         return empty_kpi, empty_fig, empty_comp
 
-    lookback = lookback or _default_lookback
-    threshold = threshold or _default_threshold
+    lookback = lookback or config.msi_default_lookback
+    threshold = threshold or config.msi_default_threshold
 
     # Compute historical MSI
     history = msi_engine.compute(threshold, lookback)
