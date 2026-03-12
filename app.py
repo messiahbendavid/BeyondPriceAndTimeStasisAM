@@ -1471,7 +1471,7 @@ app.layout = html.Div([
                 style={'width': '90px', 'fontSize': '10px',
                        'display': 'inline-block'}),
             html.Span(
-                f"  Sample: {', '.join(_sample_symbols)}",
+                f"  Sample: {', '.join(config.msi_sample_symbols)}",
                 style={'fontSize': '9px', 'color': '#888',
                        'marginLeft': '16px'}),
         ], className="d-flex align-items-center",
